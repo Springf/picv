@@ -60,3 +60,7 @@ To achieve maximum performance and the lowest memory footprint, the implementati
   - `Page Up / Page Down` circumvent panning translating exclusively to folder structures.
   - `Home / End` arrays explicitly load immediate vectors mapped entirely to zero-order or endpoint maximums.
   - `L Key` translates directly outward via an external `/select` binding onto native `explorer.exe`, popping the OS file explorer strictly overlapping the underlying photo structure path on physical disk.
+- **Background Prefetching**:
+  - Implements a single background worker thread (`std::thread`) to seamlessly pre-decode `IWICBitmap` references asynchronously into an in-memory cache map.
+  - Dynamically evaluates a continuous sliding window covering 10 total images (-3 to +6 from the center viewpoint). Window calculations explicitly wrap around logic-bounds scaling effectively across endpoints.
+  - Decodes full arrays cleanly using `WICBitmapCacheOnLoad` converting raw blobs exclusively off the UI thread and maintaining lockless synchrony ensuring ultra-fast D2D drawing and virtually zero navigation latency.

@@ -535,10 +535,6 @@ private:
             m_exifText = m_images[index].path + L"\n" + m_exifText;
         }
 
-        SafeRelease(&pConverter);
-        SafeRelease(&pSource);
-        SafeRelease(&pDecoder);
-
         SetWindowTextW(m_hwnd, path.c_str());
         InvalidateRect(m_hwnd, NULL, FALSE);
     }
