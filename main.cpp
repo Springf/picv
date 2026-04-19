@@ -24,6 +24,7 @@
 #include <thread>
 #include <mutex>
 #include <iostream>
+#include <unordered_set>
 
 #pragma comment(lib, "d2d1.lib")
 #pragma comment(lib, "dwrite.lib")
@@ -78,6 +79,8 @@ public:
 
         hr = CoCreateInstance(CLSID_WICImagingFactory, NULL, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&m_pWICFactory));
         if (FAILED(hr)) return hr;
+
+        FetchWicSupportedExtensions();
 
         hr = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory), reinterpret_cast<IUnknown**>(&m_pDWriteFactory));
         if (FAILED(hr)) return hr;
@@ -142,6 +145,44 @@ public:
     }
 
 private:
+    std::unordered_set<std::wstring> m_supportedExtensions;
+
+    void FetchWicSupportedExtensions() {
+        m_supportedExtensions.clear();
+        if (!m_pWICFactory) return;
+
+        IEnumUnknown* pEnum = NULL;
+        if (SUCCEEDED(m_pWICFactory->CreateComponentEnumerator(WICDecoder, WICComponentEnumerateDefault, &pEnum))) {
+            IUnknown* pUnk = NULL;
+            ULONG cbActual = 0;
+            while (SUCCEEDED(pEnum->Next(1, &pUnk, &cbActual)) && cbActual == 1) {
+                IWICBitmapDecoderInfo* pInfo = NULL;
+                if (SUCCEEDED(pUnk->QueryInterface(IID_PPV_ARGS(&pInfo)))) {
+                    UINT cch = 0;
+                    if (SUCCEEDED(pInfo->GetFileExtensions(0, NULL, &cch)) && cch > 0) {
+                        std::vector<WCHAR> exts(cch);
+                        if (SUCCEEDED(pInfo->GetFileExtensions(cch, exts.data(), &cch))) {
+                            std::wstring extStr(exts.data());
+                            size_t start = 0, end = 0;
+                            while ((end = extStr.find(L',', start)) != std::wstring::npos) {
+                                std::wstring ext = extStr.substr(start, end - start);
+                                std::transform(ext.begin(), ext.end(), ext.begin(), ::towlower);
+                                m_supportedExtensions.insert(ext);
+                                start = end + 1;
+                            }
+                            std::wstring ext = extStr.substr(start);
+                            std::transform(ext.begin(), ext.end(), ext.begin(), ::towlower);
+                            if (!ext.empty()) m_supportedExtensions.insert(ext);
+                        }
+                    }
+                    pInfo->Release();
+                }
+                pUnk->Release();
+            }
+            pEnum->Release();
+        }
+    }
+
     HWND m_hwnd;
     WindowMode m_mode;
     ZoomMode m_zoomMode;
@@ -258,9 +299,7 @@ private:
                 if (entry.is_regular_file(ec)) {
                     auto ext = entry.path().extension().wstring();
                     std::transform(ext.begin(), ext.end(), ext.begin(), ::towlower);
-                    if (ext == L".jpg" || ext == L".jpeg" || ext == L".png" || ext == L".bmp" || ext == L".webp" ||
-                        ext == L".heic" || ext == L".heif" || ext == L".dng" || ext == L".tiff" || ext == L".tif" ||
-                        ext == L".gif" || ext == L".avif") {
+                    if (m_supportedExtensions.count(ext) > 0) {
                         ImageEntry ie;
                         ie.path = entry.path().wstring();
                         ie.sortTime = 0;
