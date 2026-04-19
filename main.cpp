@@ -631,12 +631,19 @@ private:
         // Update EXIF text if it's currently hidden or showing a placeholder
         if (isHit && !cachedExif.empty()) {
             m_exifText = cachedExif;
-        } else if (!isRefresh || m_exifText.empty()) {
-            m_exifText = m_images[index].path;
+        } else if (!isRefresh || m_exifText.empty() || m_exifText == path) {
+            m_exifText = ExtractExifString(path);
         }
 
         SetWindowTextW(m_hwnd, path.c_str());
         InvalidateRect(m_hwnd, NULL, FALSE);
+        UpdateWindow(m_hwnd);
+
+        // Discard any keyboard or mouse-wheel events that queued up while the UI thread was blocked loading this image
+        MSG msg;
+        while (PeekMessage(&msg, m_hwnd, WM_KEYDOWN, WM_KEYDOWN, PM_REMOVE));
+        while (PeekMessage(&msg, m_hwnd, WM_KEYUP, WM_KEYUP, PM_REMOVE));
+        while (PeekMessage(&msg, m_hwnd, WM_MOUSEWHEEL, WM_MOUSEWHEEL, PM_REMOVE));
     }
 
     WICBitmapTransformOptions GetWicTransformOptions(const std::wstring& path) {
