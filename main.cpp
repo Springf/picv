@@ -75,7 +75,7 @@ public:
         }
 
         for (auto& pair : m_prefetchCache) {
-            SafeRelease(&pair.second);
+            SafeRelease(&pair.second.pWicBitmap);
         }
         m_prefetchCache.clear();
 
@@ -236,8 +236,15 @@ private:
     bool m_stopPrefetch;
     int m_prefetchCenter;
     
+    struct CacheEntry {
+        IWICBitmap* pWicBitmap;
+        std::wstring exifText;
+    };
     std::vector<ImageEntry> m_prefetchImages;
-    std::unordered_map<int, IWICBitmap*> m_prefetchCache;
+    std::unordered_map<int, CacheEntry> m_prefetchCache;
+
+    // GPU-side D2D bitmap cache (UI thread only, tied to m_pRenderTarget lifetime)
+    std::unordered_map<int, ID2D1Bitmap*> m_d2dCache;
 
     void PrefetchWorker() {
         CoInitializeEx(NULL, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
@@ -263,8 +270,10 @@ private:
 
             int numImages = (int)images.size();
             std::unordered_set<int> targetIndices;
-            for (int i = -3; i <= 6; ++i) {
-                int idx = center + i;
+            const int fetchOffsets[] = { 0, 1, 2, -1, 3, -2, 4, -3, 5, -4, 6, -5, 7, -6, 8, -7, 9, 10, 11, 12, 13, 14 };
+            int numOffsets = 20; // Exact count to bound mapping loop strictly to 20 window
+            for (int i = 0; i < numOffsets; ++i) {
+                int idx = center + fetchOffsets[i];
                 if (numImages > 0) {
                     idx = (idx % numImages + numImages) % numImages;
                     targetIndices.insert(idx);
@@ -275,7 +284,7 @@ private:
                 std::lock_guard<std::mutex> lock(m_prefetchMutex);
                 for (auto it = m_prefetchCache.begin(); it != m_prefetchCache.end(); ) {
                     if (targetIndices.find(it->first) == targetIndices.end()) {
-                        SafeRelease(&it->second);
+                        SafeRelease(&it->second.pWicBitmap);
                         it = m_prefetchCache.erase(it);
                     } else {
                         ++it;
@@ -283,7 +292,7 @@ private:
                 }
             }
 
-            for (int i = -3; i <= 6; ++i) {
+            for (int i = 0; i < numOffsets; ++i) {
                 if (m_stopPrefetch) break;
                 
                 {
@@ -293,7 +302,7 @@ private:
                     }
                 }
 
-                int idx = center + i;
+                int idx = center + fetchOffsets[i];
                 idx = (idx % numImages + numImages) % numImages;
 
                 bool isCached = false;
@@ -330,11 +339,20 @@ private:
                     SafeRelease(&pDecoder);
 
                     if (SUCCEEDED(hr) && pWicBitmap) {
-                        std::lock_guard<std::mutex> lock(m_prefetchMutex);
-                        if (images.size() == m_prefetchImages.size()) {
-                            m_prefetchCache[idx] = pWicBitmap;
-                        } else {
-                            SafeRelease(&pWicBitmap);
+                        std::wstring exifStr = ExtractExifString(path);
+                        {
+                            std::lock_guard<std::mutex> lock(m_prefetchMutex);
+                            if (images.size() == m_prefetchImages.size()) {
+                                CacheEntry entry;
+                                entry.pWicBitmap = pWicBitmap;
+                                entry.exifText = exifStr;
+                                m_prefetchCache[idx] = entry;
+                            } else {
+                                SafeRelease(&pWicBitmap);
+                            }
+                        }
+                        if (m_hwnd) {
+                            PostMessageW(m_hwnd, WM_APP + 2, (WPARAM)idx, 0);
                         }
                     }
                 }
@@ -372,6 +390,11 @@ private:
     }
 
     void DiscardDeviceResources() {
+        // D2D bitmaps are tied to the render target, must be freed first
+        for (auto& pair : m_d2dCache) {
+            SafeRelease(&pair.second);
+        }
+        m_d2dCache.clear();
         SafeRelease(&m_pRenderTarget);
         SafeRelease(&m_pBitmap);
         SafeRelease(&m_pTextBrush);
@@ -460,11 +483,16 @@ private:
                 std::lock_guard<std::mutex> lock(m_prefetchMutex);
                 m_prefetchImages = m_images;
                 for (auto& pair : m_prefetchCache) {
-                    SafeRelease(&pair.second);
+                    SafeRelease(&pair.second.pWicBitmap);
                 }
                 m_prefetchCache.clear();
                 m_prefetchCenter = m_currentIndex;
             }
+            // Clear GPU cache on folder change
+            for (auto& pair : m_d2dCache) {
+                SafeRelease(&pair.second);
+            }
+            m_d2dCache.clear();
             m_prefetchCV.notify_one();
 
             LoadImageAt(m_currentIndex);
@@ -477,69 +505,125 @@ private:
     void LoadImageAt(int index) {
         if (index < 0 || index >= (int)m_images.size()) return;
 
+        bool isRefresh = (index == m_currentIndex);
+        m_currentIndex = index;
+
         SafeRelease(&m_pBitmap);
-        m_exifText = L"";
-        m_panX = 0.0f;
-        m_panY = 0.0f;
-        m_isDragging = false;
-        m_zoomText = L"";
-        if (m_zoomTimer) { KillTimer(m_hwnd, m_zoomTimer); m_zoomTimer = 0; }
+        if (!isRefresh) {
+            m_exifText = L"";
+            m_panX = 0.0f;
+            m_panY = 0.0f;
+            m_isDragging = false;
+            m_zoomText = L"";
+            if (m_zoomTimer) { KillTimer(m_hwnd, m_zoomTimer); m_zoomTimer = 0; }
+        }
 
         if (!m_pRenderTarget) return;
 
         std::wstring path = m_images[index].path;
         IWICBitmap* pCachedBitmap = NULL;
+        std::wstring cachedExif = L"";
+        bool isHit = false;
         {
             std::lock_guard<std::mutex> lock(m_prefetchMutex);
             m_prefetchCenter = index;
             auto it = m_prefetchCache.find(index);
             if (it != m_prefetchCache.end()) {
-                pCachedBitmap = it->second;
-                pCachedBitmap->AddRef();
+                pCachedBitmap = it->second.pWicBitmap;
+                if (pCachedBitmap) pCachedBitmap->AddRef();
+                cachedExif = it->second.exifText;
+                isHit = true;
             }
         }
         m_prefetchCV.notify_one();
 
         HRESULT hr = S_OK;
-        if (pCachedBitmap) {
+        auto d2dIt = m_d2dCache.find(index);
+        if (d2dIt != m_d2dCache.end() && d2dIt->second) {
+            // First check GPU cache (zero-cost hit for fast-previews AND cached items)
+            m_pBitmap = d2dIt->second;
+            m_pBitmap->AddRef();
+            SafeRelease(&pCachedBitmap);
+        } else if (isHit && pCachedBitmap) {
+            // Found high-res WIC bitmap in memory cache, upload to GPU
             hr = m_pRenderTarget->CreateBitmapFromWicBitmap(pCachedBitmap, NULL, &m_pBitmap);
             SafeRelease(&pCachedBitmap);
+            if (SUCCEEDED(hr) && m_pBitmap) {
+                m_pBitmap->AddRef();
+                m_d2dCache[index] = m_pBitmap;
+            }
         } else {
+            // Full MISS — decode natively
             IWICBitmapDecoder* pDecoder = NULL;
-            IWICBitmapFrameDecode* pSource = NULL;
+            IWICBitmapSource* pSource = NULL;
             IWICFormatConverter* pConverter = NULL;
 
             hr = m_pWICFactory->CreateDecoderFromFilename(
                 path.c_str(), NULL, GENERIC_READ, WICDecodeMetadataCacheOnLoad, &pDecoder);
 
-            if (SUCCEEDED(hr)) hr = pDecoder->GetFrame(0, &pSource);
-            if (SUCCEEDED(hr)) hr = m_pWICFactory->CreateFormatConverter(&pConverter);
-
             if (SUCCEEDED(hr)) {
-                hr = pConverter->Initialize(
-                    pSource, GUID_WICPixelFormat32bppPBGRA, WICBitmapDitherTypeNone,
-                    NULL, 0.f, WICBitmapPaletteTypeMedianCut);
+                if (FAILED(pDecoder->GetPreview(&pSource))) {
+                    IWICBitmapFrameDecode* pFrame = NULL;
+                    if (SUCCEEDED(pDecoder->GetFrame(0, &pFrame))) {
+                        pSource = pFrame;
+                    }
+                }
             }
 
-            if (SUCCEEDED(hr)) {
-                hr = m_pRenderTarget->CreateBitmapFromWicBitmap(pConverter, NULL, &m_pBitmap);
-            }
+            if (pSource) {
+                hr = m_pWICFactory->CreateFormatConverter(&pConverter);
 
-            SafeRelease(&pConverter);
-            SafeRelease(&pSource);
+                if (SUCCEEDED(hr)) {
+                    hr = pConverter->Initialize(
+                        pSource, GUID_WICPixelFormat32bppPBGRA, WICBitmapDitherTypeNone,
+                        NULL, 0.f, WICBitmapPaletteTypeMedianCut);
+                }
+
+                if (SUCCEEDED(hr)) {
+                    hr = m_pRenderTarget->CreateBitmapFromWicBitmap(pConverter, NULL, &m_pBitmap);
+                }
+
+                SafeRelease(&pConverter);
+                SafeRelease(&pSource);
+                
+                // Cache the fast UI preview so jumping back to it is fully instant!
+                if (SUCCEEDED(hr) && m_pBitmap) {
+                    m_pBitmap->AddRef();
+                    m_d2dCache[index] = m_pBitmap;
+                }
+            }
             SafeRelease(&pDecoder);
         }
-        if (SUCCEEDED(hr)) {
-            ExtractExif(path);
-            // Append filename info
-            m_exifText = m_images[index].path + L"\n" + m_exifText;
+
+        auto Distance = [&](int a, int b) {
+            int n = (int)m_images.size();
+            if (n == 0) return 0;
+            int d = abs(a - b);
+            return min(d, n - d);
+        };
+        if (m_d2dCache.size() > 40) {
+            for (auto it = m_d2dCache.begin(); it != m_d2dCache.end(); ) {
+                if (Distance(it->first, m_currentIndex) > 20) {
+                    SafeRelease(&it->second);
+                    it = m_d2dCache.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        }
+
+        if (isHit) {
+            m_exifText = cachedExif;
+        } else if (!isRefresh) {
+            m_exifText = m_images[index].path + L"\nLoading metadata...";
         }
 
         SetWindowTextW(m_hwnd, path.c_str());
         InvalidateRect(m_hwnd, NULL, FALSE);
     }
 
-    void ExtractExif(const std::wstring& path) {
+    std::wstring ExtractExifString(const std::wstring& path) {
+        std::wstring ret = path + L"\n";
         IPropertyStore* pStore = NULL;
         std::wstring absPath = fs::absolute(path).wstring();
         if (SUCCEEDED(SHGetPropertyStoreFromParsingName(absPath.c_str(), NULL, GPS_DEFAULT, IID_PPV_ARGS(&pStore)))) {
@@ -550,7 +634,7 @@ private:
                 if (SUCCEEDED(pStore->GetValue(key, &prop))) {
                     PWSTR displayStr = NULL;
                     if (SUCCEEDED(PSFormatForDisplayAlloc(key, prop, PDFF_DEFAULT, &displayStr))) {
-                        m_exifText += std::wstring(label) + L": " + displayStr + L"\n";
+                        ret += std::wstring(label) + L": " + displayStr + L"\n";
                         CoTaskMemFree(displayStr);
                     }
                     PropVariantClear(&prop);
@@ -567,8 +651,9 @@ private:
 
             pStore->Release();
         } else {
-            m_exifText += L"EXIF: N/A\n";
+            ret += L"EXIF: N/A\n";
         }
+        return ret;
     }
 
     void OnPaint() {
@@ -731,11 +816,15 @@ private:
             std::lock_guard<std::mutex> lock(m_prefetchMutex);
             m_prefetchImages = m_images;
             for (auto& pair : m_prefetchCache) {
-                SafeRelease(&pair.second);
+                SafeRelease(&pair.second.pWicBitmap);
             }
             m_prefetchCache.clear();
             m_prefetchCenter = m_currentIndex;
         }
+        for (auto& pair : m_d2dCache) {
+            SafeRelease(&pair.second);
+        }
+        m_d2dCache.clear();
         m_prefetchCV.notify_one();
 
         m_showExif = wasExifShown;
@@ -937,6 +1026,20 @@ public:
                     pThis->ScanFolder(filePath);
                 }
                 DragFinish(hDrop);
+                return 0;
+            }
+            case WM_APP + 2: {
+                if (pThis->m_images.size() > 0) {
+                    int idx = (int)wParam;
+                    auto d2dIt = pThis->m_d2dCache.find(idx);
+                    if (d2dIt != pThis->m_d2dCache.end()) {
+                        SafeRelease(&d2dIt->second);
+                        pThis->m_d2dCache.erase(d2dIt);
+                    }
+                    if (idx == pThis->m_currentIndex) {
+                        pThis->LoadImageAt(idx);
+                    }
+                }
                 return 0;
             }
             case WM_DESTROY:
