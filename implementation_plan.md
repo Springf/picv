@@ -52,7 +52,7 @@ To achieve maximum performance and the lowest memory footprint, the implementati
 
 ### 3. Folder Navigation & Traversal Optimizations
 - **Safe Directory Isolation**: Sweeps through filesystem loops using deep internal `error_code` iterators (`fs::directory_options::skip_permission_denied`) ignoring protected OS elements entirely without failing or throwing abortive `std::filesystem::error`.
-- **Format Parity**: Standard loops aggressively evaluate parsing across standard boundaries (`.jpg`, `.png`, `.webp`, `.bmp`, `.gif`) natively extended out to dense standards (`.heic`, `.heif`, `.dng`, `.tiff`, `.tif`, `.avif`).
+- **Format Parity**: Architecture dynamically iterates and boots `IWICImagingFactory::CreateComponentEnumerator(WICDecoder)` at startup. Constructs an internal cache mapping every file extension universally supported by your installed native OS Raw decoders. This fundamentally guarantees flawless access to specialized formats like `.HEIC`, `.DNG`, or localized `.CR2` variants strictly based on native Windows extension mapping.
 - **High-Efficiency Pre-loads**: Iteration relies defaulting entirely to absolute Path configurations preventing synchronous blocking.
 - **Explicit EXIF Mapping (`S` Key)**: Deep hardware `IPropertyStore.GetValue` execution is mapped strictly to user polling. On execution, safely invalidates an immediate UI loop rendering an active "Please Wait" screen, re-sorting all values by literal `PKEY_Photo_DateTaken`, prior to reinstating active rendering configuration safely on the last-tracked visual bounds.
 - **Shortcut Controls**:

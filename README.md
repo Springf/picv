@@ -2,6 +2,16 @@
 
 `picv` is an ultra-fast, extremely lightweight native C++ picture viewer engineered for Windows. Built directly on top of raw Win32 APIs, Direct2D, and the Windows Imaging Component (WIC), it provides absolute zero-overhead GPU-accelerated rendering and instantaneous load times explicitly optimized for massive media folders and heavy structural formats.
 
+## Supported Formats
+
+`picv` is completely unbounded by hard-coded formats. Unlike traditional viewers, it implements a dynamic registry sweep upon launch! Scanning Windows' `IWICImagingFactory`, any image codec installed natively on your OS is instantly supported.
+
+Out of the box, standard codecs include `.jpg`, `.png`, `.bmp`, `.gif`, and `.tiff`. By downloading extensions from the Microsoft Store, you dynamically unlock access resolving high-density raw formats directly onto the GPU without any compilation steps required:
+- `HEIF Image Extensions`: Unlocks Apple `.HEIC` and `.HEIF`
+- `Raw Image Extension`: Unlocks unbounded manufacturer RAWs (`.DNG`, `.CR2`, `.NEF`, `.ARW`, etc.)
+- `AV1 Video Extension`: Unlocks `.AVIF`
+- `WebP Image Extensions`: Unlocks `.WEBP`
+
 ## Navigation & Controls
 
 `picv` features heavy UX considerations to ensure traversing thousands of files is intuitive and frictionless.
