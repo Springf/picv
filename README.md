@@ -37,3 +37,24 @@ No heavy menus or settings logic exist. UI is strictly hotkey-bound.
 - **I Key**: Toggles a live metadata heads-up overlay decoding and printing the associated `Camera Model`, true `Exposure`, `ISO`, and internal `Dimensions` pulled directly via the native OS `IPropertyStore`.
 - **L Key**: Implements an instantaneous breakout jumping natively into `explorer.exe`, seamlessly highlighting the photo identically where it resides on your physical hard drive structure.
 - **Drag-And-Drop**: Flawlessly intercept any incoming Windows Drag interaction, instantly loading dropped imagery mid-run.
+
+## Build Instructions
+
+`picv` is developed entirely using Standard C++ targeting native OS features and requires the Microsoft Visual Studio CMake framework.
+
+### Prerequisites
+1. Installed toolchain via [Visual Studio 2026](https://visualstudio.microsoft.com/vs/) (or newer).
+2. Within the installer, select the **"Desktop development with C++"** core workload.
+3. On the right-side details panel, ensure the **Windows 11 SDK** and **C++ CMake tools for Windows** packages are actively checked.
+
+### Compiling from Source
+Once the MSVC toolset is successfully configured, building the `.exe` requires just two commands:
+
+1. Launch your **x64 Native Tools Command Prompt for VS 2026** (or activate the `vcvars64.bat` script).
+2. Navigate terminal to the root of this cloned repository.
+3. Execute the CMake build process:
+   ```cmd
+   cmake -B build
+   cmake --build build --config Release
+   ```
+4. The GPU-accelerated application will be freshly dumped at `build\Release\picv.exe`.
