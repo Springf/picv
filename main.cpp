@@ -25,6 +25,8 @@
 #include <mutex>
 #include <iostream>
 #include <unordered_set>
+#include <unordered_map>
+#include <condition_variable>
 
 #pragma comment(lib, "d2d1.lib")
 #pragma comment(lib, "dwrite.lib")
@@ -56,12 +58,27 @@ public:
                   m_pD2DFactory(NULL), m_pRenderTarget(NULL), 
                   m_pWICFactory(NULL), m_pDWriteFactory(NULL), m_pTextFormat(NULL),
                   m_pBitmap(NULL), m_showExif(false), m_dpiX(96.0f), m_dpiY(96.0f),
-                  m_zoomMode(ZoomMode::FitBoth), m_customZoom(1.0f) {
+                  m_zoomMode(ZoomMode::FitBoth), m_customZoom(1.0f),
+                  m_stopPrefetch(false), m_prefetchCenter(-1) {
         ZeroMemory(&m_wpPrev, sizeof(m_wpPrev));
         m_wpPrev.length = sizeof(WINDOWPLACEMENT);
     }
 
     ~PicViewer() {
+        {
+            std::lock_guard<std::mutex> lock(m_prefetchMutex);
+            m_stopPrefetch = true;
+        }
+        m_prefetchCV.notify_one();
+        if (m_prefetchThread.joinable()) {
+            m_prefetchThread.join();
+        }
+
+        for (auto& pair : m_prefetchCache) {
+            SafeRelease(&pair.second);
+        }
+        m_prefetchCache.clear();
+
         DiscardDeviceResources();
         SafeRelease(&m_pTextFormat);
         SafeRelease(&m_pDWriteFactory);
@@ -132,6 +149,8 @@ public:
         LocalFree(argv);
 
         ScanFolder(startPath);
+
+        m_prefetchThread = std::thread(&PicViewer::PrefetchWorker, this);
 
         return S_OK;
     }
@@ -210,6 +229,121 @@ private:
     std::wstring m_exifText;
     bool m_showExif;
     float m_dpiX, m_dpiY;
+
+    std::thread m_prefetchThread;
+    std::mutex m_prefetchMutex;
+    std::condition_variable m_prefetchCV;
+    bool m_stopPrefetch;
+    int m_prefetchCenter;
+    
+    std::vector<ImageEntry> m_prefetchImages;
+    std::unordered_map<int, IWICBitmap*> m_prefetchCache;
+
+    void PrefetchWorker() {
+        CoInitializeEx(NULL, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+        IWICImagingFactory* pWicFactory = NULL;
+        CoCreateInstance(CLSID_WICImagingFactory, NULL, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&pWicFactory));
+
+        while (true) {
+            int center;
+            std::vector<ImageEntry> images;
+            {
+                std::unique_lock<std::mutex> lock(m_prefetchMutex);
+                m_prefetchCV.wait(lock, [this]() {
+                    return m_stopPrefetch || (m_prefetchImages.size() > 0 && m_prefetchCenter >= 0);
+                });
+                
+                if (m_stopPrefetch) break;
+                
+                center = m_prefetchCenter;
+                images = m_prefetchImages;
+            }
+            
+            if (images.empty()) continue;
+
+            int numImages = (int)images.size();
+            std::unordered_set<int> targetIndices;
+            for (int i = -3; i <= 6; ++i) {
+                int idx = center + i;
+                if (numImages > 0) {
+                    idx = (idx % numImages + numImages) % numImages;
+                    targetIndices.insert(idx);
+                }
+            }
+
+            {
+                std::lock_guard<std::mutex> lock(m_prefetchMutex);
+                for (auto it = m_prefetchCache.begin(); it != m_prefetchCache.end(); ) {
+                    if (targetIndices.find(it->first) == targetIndices.end()) {
+                        SafeRelease(&it->second);
+                        it = m_prefetchCache.erase(it);
+                    } else {
+                        ++it;
+                    }
+                }
+            }
+
+            for (int i = -3; i <= 6; ++i) {
+                if (m_stopPrefetch) break;
+                
+                {
+                    std::lock_guard<std::mutex> lock(m_prefetchMutex);
+                    if (center != m_prefetchCenter || m_prefetchImages.size() != images.size()) {
+                        break; 
+                    }
+                }
+
+                int idx = center + i;
+                idx = (idx % numImages + numImages) % numImages;
+
+                bool isCached = false;
+                {
+                    std::lock_guard<std::mutex> lock(m_prefetchMutex);
+                    isCached = (m_prefetchCache.find(idx) != m_prefetchCache.end());
+                }
+
+                if (!isCached && pWicFactory) {
+                    std::wstring path = images[idx].path;
+                    
+                    IWICBitmapDecoder* pDecoder = NULL;
+                    IWICBitmapFrameDecode* pSource = NULL;
+                    IWICFormatConverter* pConverter = NULL;
+                    IWICBitmap* pWicBitmap = NULL;
+
+                    HRESULT hr = pWicFactory->CreateDecoderFromFilename(
+                        path.c_str(), NULL, GENERIC_READ, WICDecodeMetadataCacheOnLoad, &pDecoder);
+
+                    if (SUCCEEDED(hr)) hr = pDecoder->GetFrame(0, &pSource);
+                    if (SUCCEEDED(hr)) hr = pWicFactory->CreateFormatConverter(&pConverter);
+
+                    if (SUCCEEDED(hr)) {
+                        hr = pConverter->Initialize(
+                            pSource, GUID_WICPixelFormat32bppPBGRA, WICBitmapDitherTypeNone,
+                            NULL, 0.f, WICBitmapPaletteTypeMedianCut);
+                    }
+                    if (SUCCEEDED(hr)) {
+                        hr = pWicFactory->CreateBitmapFromSource(pConverter, WICBitmapCacheOnLoad, &pWicBitmap);
+                    }
+
+                    SafeRelease(&pConverter);
+                    SafeRelease(&pSource);
+                    SafeRelease(&pDecoder);
+
+                    if (SUCCEEDED(hr) && pWicBitmap) {
+                        std::lock_guard<std::mutex> lock(m_prefetchMutex);
+                        if (images.size() == m_prefetchImages.size()) {
+                            m_prefetchCache[idx] = pWicBitmap;
+                        } else {
+                            SafeRelease(&pWicBitmap);
+                        }
+                    }
+                }
+            }
+        }
+
+        SafeRelease(&pWicFactory);
+        CoUninitialize();
+    }
 
     HRESULT CreateDeviceResources() {
         HRESULT hr = S_OK;
@@ -322,6 +456,17 @@ private:
                 }
             }
 
+            {
+                std::lock_guard<std::mutex> lock(m_prefetchMutex);
+                m_prefetchImages = m_images;
+                for (auto& pair : m_prefetchCache) {
+                    SafeRelease(&pair.second);
+                }
+                m_prefetchCache.clear();
+                m_prefetchCenter = m_currentIndex;
+            }
+            m_prefetchCV.notify_one();
+
             LoadImageAt(m_currentIndex);
 
         } catch (...) {
@@ -343,27 +488,47 @@ private:
         if (!m_pRenderTarget) return;
 
         std::wstring path = m_images[index].path;
-        IWICBitmapDecoder* pDecoder = NULL;
-        IWICBitmapFrameDecode* pSource = NULL;
-        IWICFormatConverter* pConverter = NULL;
-
-        HRESULT hr = m_pWICFactory->CreateDecoderFromFilename(
-            path.c_str(), NULL, GENERIC_READ, WICDecodeMetadataCacheOnLoad, &pDecoder);
-
-        if (SUCCEEDED(hr)) hr = pDecoder->GetFrame(0, &pSource);
-        if (SUCCEEDED(hr)) hr = m_pWICFactory->CreateFormatConverter(&pConverter);
-
-        if (SUCCEEDED(hr)) {
-            hr = pConverter->Initialize(
-                pSource, GUID_WICPixelFormat32bppPBGRA, WICBitmapDitherTypeNone,
-                NULL, 0.f, WICBitmapPaletteTypeMedianCut);
+        IWICBitmap* pCachedBitmap = NULL;
+        {
+            std::lock_guard<std::mutex> lock(m_prefetchMutex);
+            m_prefetchCenter = index;
+            auto it = m_prefetchCache.find(index);
+            if (it != m_prefetchCache.end()) {
+                pCachedBitmap = it->second;
+                pCachedBitmap->AddRef();
+            }
         }
+        m_prefetchCV.notify_one();
 
-        if (SUCCEEDED(hr)) {
-            hr = m_pRenderTarget->CreateBitmapFromWicBitmap(pConverter, NULL, &m_pBitmap);
+        HRESULT hr = S_OK;
+        if (pCachedBitmap) {
+            hr = m_pRenderTarget->CreateBitmapFromWicBitmap(pCachedBitmap, NULL, &m_pBitmap);
+            SafeRelease(&pCachedBitmap);
+        } else {
+            IWICBitmapDecoder* pDecoder = NULL;
+            IWICBitmapFrameDecode* pSource = NULL;
+            IWICFormatConverter* pConverter = NULL;
+
+            hr = m_pWICFactory->CreateDecoderFromFilename(
+                path.c_str(), NULL, GENERIC_READ, WICDecodeMetadataCacheOnLoad, &pDecoder);
+
+            if (SUCCEEDED(hr)) hr = pDecoder->GetFrame(0, &pSource);
+            if (SUCCEEDED(hr)) hr = m_pWICFactory->CreateFormatConverter(&pConverter);
+
+            if (SUCCEEDED(hr)) {
+                hr = pConverter->Initialize(
+                    pSource, GUID_WICPixelFormat32bppPBGRA, WICBitmapDitherTypeNone,
+                    NULL, 0.f, WICBitmapPaletteTypeMedianCut);
+            }
+
+            if (SUCCEEDED(hr)) {
+                hr = m_pRenderTarget->CreateBitmapFromWicBitmap(pConverter, NULL, &m_pBitmap);
+            }
+
+            SafeRelease(&pConverter);
+            SafeRelease(&pSource);
+            SafeRelease(&pDecoder);
         }
-
-        // Load EXIF
         if (SUCCEEDED(hr)) {
             ExtractExif(path);
             // Append filename info
@@ -565,6 +730,17 @@ private:
                 break;
             }
         }
+
+        {
+            std::lock_guard<std::mutex> lock(m_prefetchMutex);
+            m_prefetchImages = m_images;
+            for (auto& pair : m_prefetchCache) {
+                SafeRelease(&pair.second);
+            }
+            m_prefetchCache.clear();
+            m_prefetchCenter = m_currentIndex;
+        }
+        m_prefetchCV.notify_one();
 
         m_showExif = wasExifShown;
         LoadImageAt(m_currentIndex);
