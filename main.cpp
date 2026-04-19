@@ -59,7 +59,7 @@ public:
     PicViewer() : m_hwnd(NULL), m_mode(WindowMode::Standard), m_currentIndex(-1),
                   m_pD2DFactory(NULL), m_pRenderTarget(NULL), 
                   m_pWICFactory(NULL), m_pDWriteFactory(NULL), m_pTextFormat(NULL),
-                  m_pBitmap(NULL), m_showExif(true), m_dpiX(96.0f), m_dpiY(96.0f),
+                  m_pBitmap(NULL), m_showExif(false), m_dpiX(96.0f), m_dpiY(96.0f),
                   m_zoomMode(ZoomMode::FitBoth), m_customZoom(1.0f),
                   m_stopPrefetch(false), m_prefetchCenter(-1), m_useDemosaic(false) {
         ZeroMemory(&m_wpPrev, sizeof(m_wpPrev));
@@ -335,8 +335,14 @@ private:
                             pSource, GUID_WICPixelFormat32bppPBGRA, WICBitmapDitherTypeNone,
                             NULL, 0.f, WICBitmapPaletteTypeMedianCut);
                     }
+
                     if (SUCCEEDED(hr)) {
-                        hr = pWicFactory->CreateBitmapFromSource(pConverter, WICBitmapCacheOnLoad, &pWicBitmap);
+                        WICBitmapTransformOptions options = GetWicTransformOptions(path);
+                        IWICBitmapSource* pRotated = NULL;
+                        if (SUCCEEDED(RotateSource(pConverter, options, &pRotated))) {
+                            hr = pWicFactory->CreateBitmapFromSource(pRotated, WICBitmapCacheOnLoad, &pWicBitmap);
+                            SafeRelease(&pRotated);
+                        }
                     }
 
                     SafeRelease(&pConverter);
@@ -585,7 +591,12 @@ private:
                 }
 
                 if (SUCCEEDED(hr)) {
-                    hr = m_pRenderTarget->CreateBitmapFromWicBitmap(pConverter, NULL, &m_pBitmap);
+                    WICBitmapTransformOptions options = GetWicTransformOptions(path);
+                    IWICBitmapSource* pRotated = NULL;
+                    if (SUCCEEDED(RotateSource(pConverter, options, &pRotated))) {
+                        hr = m_pRenderTarget->CreateBitmapFromWicBitmap(pRotated, NULL, &m_pBitmap);
+                        SafeRelease(&pRotated);
+                    }
                 }
 
                 SafeRelease(&pConverter);
@@ -620,15 +631,55 @@ private:
         // Update EXIF text if it's currently hidden or showing a placeholder
         if (isHit && !cachedExif.empty()) {
             m_exifText = cachedExif;
-        } else if (!isRefresh) {
-            m_exifText = m_images[index].path + L"\nLoading metadata...";
-        } else if (m_exifText.empty()) {
-            // Fallback for refresh if we somehow don't have metadata yet
-            m_exifText = m_images[index].path + L"\nLoading...";
+        } else if (!isRefresh || m_exifText.empty()) {
+            m_exifText = m_images[index].path;
         }
 
         SetWindowTextW(m_hwnd, path.c_str());
         InvalidateRect(m_hwnd, NULL, FALSE);
+    }
+
+    WICBitmapTransformOptions GetWicTransformOptions(const std::wstring& path) {
+        IPropertyStore* pStore = NULL;
+        std::wstring absPath = fs::absolute(path).wstring();
+        WICBitmapTransformOptions options = WICBitmapTransformRotate0;
+        if (SUCCEEDED(SHGetPropertyStoreFromParsingName(absPath.c_str(), NULL, GPS_DEFAULT, IID_PPV_ARGS(&pStore)))) {
+            PROPVARIANT prop;
+            PropVariantInit(&prop);
+            if (SUCCEEDED(pStore->GetValue(PKEY_Photo_Orientation, &prop)) && prop.vt == VT_UI2) {
+                switch (prop.uintVal) {
+                    case 2: options = WICBitmapTransformFlipHorizontal; break;
+                    case 3: options = WICBitmapTransformRotate180; break;
+                    case 4: options = WICBitmapTransformFlipVertical; break;
+                    case 5: options = (WICBitmapTransformOptions)(WICBitmapTransformRotate90 | WICBitmapTransformFlipHorizontal); break;
+                    case 6: options = WICBitmapTransformRotate90; break;
+                    case 7: options = (WICBitmapTransformOptions)(WICBitmapTransformRotate270 | WICBitmapTransformFlipHorizontal); break;
+                    case 8: options = WICBitmapTransformRotate270; break;
+                }
+            }
+            PropVariantClear(&prop);
+            pStore->Release();
+        }
+        return options;
+    }
+
+    HRESULT RotateSource(IWICBitmapSource* pSource, WICBitmapTransformOptions options, IWICBitmapSource** ppOut) {
+        if (options == WICBitmapTransformRotate0) {
+            *ppOut = pSource;
+            pSource->AddRef();
+            return S_OK;
+        }
+        IWICBitmapFlipRotator* pRotator = NULL;
+        HRESULT hr = m_pWICFactory->CreateBitmapFlipRotator(&pRotator);
+        if (SUCCEEDED(hr)) {
+            hr = pRotator->Initialize(pSource, options);
+            if (SUCCEEDED(hr)) {
+                *ppOut = pRotator;
+            } else {
+                SafeRelease(&pRotator);
+            }
+        }
+        return hr;
     }
 
     std::wstring ExtractExifString(const std::wstring& path) {
@@ -1051,13 +1102,17 @@ public:
                 return 0;
             }
             case WM_APP + 2: {
-                if (pThis->m_images.size() > 0 && pThis->m_useDemosaic) {
+                if (pThis->m_images.size() > 0) {
                     int idx = (int)wParam;
-                    auto d2dIt = pThis->m_d2dCache.find(idx);
-                    if (d2dIt != pThis->m_d2dCache.end()) {
-                        SafeRelease(&d2dIt->second);
-                        pThis->m_d2dCache.erase(d2dIt);
+                    // Only evict the preview/low-res cache if we want to "upgrade" to full resolution
+                    if (pThis->m_useDemosaic) {
+                        auto d2dIt = pThis->m_d2dCache.find(idx);
+                        if (d2dIt != pThis->m_d2dCache.end()) {
+                            SafeRelease(&d2dIt->second);
+                            pThis->m_d2dCache.erase(d2dIt);
+                        }
                     }
+                    // Always refresh if this is the current image (to update EXIF metadata string)
                     if (idx == pThis->m_currentIndex) {
                         pThis->LoadImageAt(idx);
                     }
