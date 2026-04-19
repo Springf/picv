@@ -27,6 +27,8 @@
 #include <unordered_set>
 #include <unordered_map>
 #include <condition_variable>
+#include <algorithm>
+#include "resource.h"
 
 #pragma comment(lib, "d2d1.lib")
 #pragma comment(lib, "dwrite.lib")
@@ -57,9 +59,9 @@ public:
     PicViewer() : m_hwnd(NULL), m_mode(WindowMode::Standard), m_currentIndex(-1),
                   m_pD2DFactory(NULL), m_pRenderTarget(NULL), 
                   m_pWICFactory(NULL), m_pDWriteFactory(NULL), m_pTextFormat(NULL),
-                  m_pBitmap(NULL), m_showExif(false), m_dpiX(96.0f), m_dpiY(96.0f),
+                  m_pBitmap(NULL), m_showExif(true), m_dpiX(96.0f), m_dpiY(96.0f),
                   m_zoomMode(ZoomMode::FitBoth), m_customZoom(1.0f),
-                  m_stopPrefetch(false), m_prefetchCenter(-1) {
+                  m_stopPrefetch(false), m_prefetchCenter(-1), m_useDemosaic(false) {
         ZeroMemory(&m_wpPrev, sizeof(m_wpPrev));
         m_wpPrev.length = sizeof(WINDOWPLACEMENT);
     }
@@ -116,9 +118,11 @@ public:
         wcex.cbClsExtra = 0;
         wcex.cbWndExtra = sizeof(LONG_PTR);
         wcex.hInstance = GetModuleHandle(NULL);
+        wcex.hIcon = LoadIcon(wcex.hInstance, MAKEINTRESOURCE(IDI_APP_ICON));
         wcex.hCursor = LoadCursor(NULL, IDC_ARROW);
         wcex.hbrBackground = NULL;
         wcex.lpszClassName = L"PicViewerClass";
+        wcex.hIconSm = LoadIcon(wcex.hInstance, MAKEINTRESOURCE(IDI_APP_ICON));
 
         RegisterClassEx(&wcex);
 
@@ -228,6 +232,7 @@ private:
     int m_currentIndex;
     std::wstring m_exifText;
     bool m_showExif;
+    bool m_useDemosaic;
     float m_dpiX, m_dpiY;
 
     std::thread m_prefetchThread;
@@ -544,7 +549,7 @@ private:
             m_pBitmap = d2dIt->second;
             m_pBitmap->AddRef();
             SafeRelease(&pCachedBitmap);
-        } else if (isHit && pCachedBitmap) {
+        } else if (m_useDemosaic && isHit && pCachedBitmap) {
             // Found high-res WIC bitmap in memory cache, upload to GPU
             hr = m_pRenderTarget->CreateBitmapFromWicBitmap(pCachedBitmap, NULL, &m_pBitmap);
             SafeRelease(&pCachedBitmap);
@@ -612,10 +617,14 @@ private:
             }
         }
 
-        if (isHit) {
+        // Update EXIF text if it's currently hidden or showing a placeholder
+        if (isHit && !cachedExif.empty()) {
             m_exifText = cachedExif;
         } else if (!isRefresh) {
             m_exifText = m_images[index].path + L"\nLoading metadata...";
+        } else if (m_exifText.empty()) {
+            // Fallback for refresh if we somehow don't have metadata yet
+            m_exifText = m_images[index].path + L"\nLoading...";
         }
 
         SetWindowTextW(m_hwnd, path.c_str());
@@ -756,6 +765,18 @@ private:
     void ToggleExif() {
         m_showExif = !m_showExif;
         InvalidateRect(m_hwnd, NULL, FALSE);
+    }
+ 
+    void ToggleQuality() {
+        m_useDemosaic = !m_useDemosaic;
+        // Evict current image from GPU cache to force reload at new quality
+        auto it = m_d2dCache.find(m_currentIndex);
+        if (it != m_d2dCache.end()) {
+            SafeRelease(&it->second);
+            m_d2dCache.erase(it);
+        }
+        LoadImageAt(m_currentIndex);
+        ShowZoomOverlay(m_useDemosaic ? L"Quality: Full Resolution" : L"Quality: Fast Preview");
     }
 
     void Navigate(int step) {
@@ -954,6 +975,7 @@ public:
                 else if (wParam == VK_END) pThis->NavigateLast();
                 else if (wParam == 'F') pThis->ToggleWindowMode();
                 else if (wParam == 'I') pThis->ToggleExif();
+                else if (wParam == 'P') pThis->ToggleQuality();
                 else if (wParam == 'L') pThis->LocateInExplorer();
                 else if (wParam == 'S') pThis->SortByExif();
                 else if (wParam == 'Z') pThis->ToggleZoomZ();
@@ -1029,7 +1051,7 @@ public:
                 return 0;
             }
             case WM_APP + 2: {
-                if (pThis->m_images.size() > 0) {
+                if (pThis->m_images.size() > 0 && pThis->m_useDemosaic) {
                     int idx = (int)wParam;
                     auto d2dIt = pThis->m_d2dCache.find(idx);
                     if (d2dIt != pThis->m_d2dCache.end()) {

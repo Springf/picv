@@ -5,7 +5,7 @@ set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED True)
 
 # Set subsystem as Windows so we don't get a command console popping up
-add_executable(picv WIN32 main.cpp)
+add_executable(picv WIN32 main.cpp resources.rc)
 
 # Link Windows libraries
 target_link_libraries(picv PRIVATE 
