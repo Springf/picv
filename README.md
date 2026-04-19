@@ -58,13 +58,21 @@ No heavy menus or settings logic exist. UI is strictly hotkey-bound.
 3. On the right-side details panel, ensure the **Windows 11 SDK** and **C++ CMake tools for Windows** packages are actively checked.
 
 ### Compiling from Source
-Once the MSVC toolset is successfully configured, building the `.exe` requires just two commands:
+Once the MSVC toolset is successfully configured, building the `.exe` requires initializing the compiler paths. 
 
-1. Launch your **x64 Native Tools Command Prompt for VS 2026** (or activate the `vcvars64.bat` script).
-2. Navigate terminal to the root of this cloned repository.
+**Option A: Using the Visual Studio Command Prompt**
+1. Open your Start Menu and search for **x64 Native Tools Command Prompt for VS 2026**.
+2. Navigate to the root of this cloned repository.
 3. Execute the CMake build process:
    ```cmd
    cmake -B build
    cmake --build build --config Release
    ```
-4. The GPU-accelerated application will be freshly dumped at `build\Release\picv.exe`.
+
+**Option B: Using PowerShell (e.g., inside VSCode)**
+If you are currently inside a PowerShell terminal, running `.bat` files does not retain environment variables. You must launch the commands wrapped inside a `cmd.exe` process:
+```powershell
+cmd.exe /c "call `"C:\Program Files\Microsoft Visual Studio\18\Community\VC\Auxiliary\Build\vcvars64.bat`" && cmake -B build && cmake --build build --config Release"
+```
+
+4. The GPU-accelerated application will natively compile and be available at `build\Release\picv.exe`.
